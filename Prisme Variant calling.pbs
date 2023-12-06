@@ -1,0 +1,86 @@
+#!/bin/sh
+#PBS -N prism
+#PBS -j oe
+#PBS -l ncpus=4
+#PBS -l nodes=1
+#PBS -l mem=30G
+cd /jingzhang/prism
+set -e
+
+
+## VERSION: V1 20210531
+inputpath=/xGen_Prism_FFPE_Example_Data
+outpath=/prism/demo
+target=/Probes_Standard.bed
+genome=/hg19/seq/hg19.fa
+picard=/picard.jar
+fgbio=/fgbio.jar
+anno=/table_annovar.pl
+Vardict_Dir=/VarDict-1.5.8/bin
+min_af=0.01
+qualimap_dir=/qualimap
+
+
+
+##### 1. construct an unmapped BAM
+java -jar /software/picard.jar FastqToSam FASTQ=$inputpath/Sample_${sample}/${sample}_combined_R1.fastq.gz FASTQ2=$inputpath/Sample_${sample}/${sample}_combined_R2.fastq.gz O=${sample}}.unmaped.bam SM=sample
+
+
+#### 2. Extract UMIs and add to the RX tag
+java -jar  ${fgbio} ExtractUmisFromBam --input=${sample}.unmaped.bam --output=${sample}.unmaped_withUMI.bam --read-structure=8M143T 8M143T --molecular-index-tags=ZA ZB --single-tag=RX
+
+
+#### 3. Align reads
+java -jar ${picard} SamToFastq I=${outpath}/${sample}.unmaped_withUMI.bam F=/dev/stdout INTERLEAVE=true | bwa mem -p -t 4 ${genome} /dev/stdin | java -jar ${picard} MergeBamAlignment UNMAPPED=${outpath}/${sample}.unmaped_withUMI.bam ALIGNED=/dev/stdin O=${outpath}/${sample}_mapped.bam R=${genome} SO=coordinate ALIGNER_PROPER_PAIR_FLAGS=true MAX_GAPS=-1 ORIENTATIONS=FR VALIDATION_STRINGENCY=SILENT CREATE_INDEX=true
+
+
+#### 4.Deduplication or correction
+java -jar ${fgbio} CorrectUmis -i ${outpath}/${sample}_mapped.bam -o ${outpath}/${sample}_mapped.fixedumi.bam --max-mismatches=3 --min-distance=1 -M ${outpath}/${sample}_metrics.txt -r ${outpath}/${sample}_rejected.bam -t RX -u GAGACGAT TTCCAAGG CGCATGAT ACGGAACA GCTATCCT TGGACTCT ATCCAGAG CTTAGGAC GTGCCATA TCGCTGTT TTCGTTGG AAGCACTG GTCGAAGA ACCACGAT GATTACCG GCACAACT GAAGGAAG ACTGAGGT TGAAGACG GTTACGCA AGCGTGTT GATCGAGT TTGCGAAG CTGTTGAC GATGTGTG ACGTTCAG TTGCAGAC CAATGTGG ACGACTTG ACTAGGAG
+
+java -jar ${fgbio} GroupReadsByUmi --input=${outpath}/${sample}_mapped.fixedumi.bam --output=${outpath}/${sample}_grouped.bam --strategy=paired --edits=0 --min-map-q=20
+
+java -jar ${fgbio} CallDuplexConsensusReads --input=${outpath}/${sample}_grouped.bam --output=${outpath}/${sample}_consensus.unmapped.bam --error-rate-pre-umi=45 --error-rate-post-umi=30 --min-input-base-quality=30
+
+java -jar ${picard} SamToFastq I=${outpath}/${sample}_consensus.unmapped.bam F=/dev/stdout INTERLEAVE=true | bwa mem -p -t 8 ${genome} /dev/stdin | java -jar ${picard} MergeBamAlignment UNMAPPED=${outpath}/${sample}_consensus.unmapped.bam ALIGNED=/dev/stdin O=${outpath}/${sample}_consensus.mapped.bam R=${genome} SO=coordinate ALIGNER_PROPER_PAIR_FLAGS=true MAX_GAPS=-1 ORIENTATIONS=FR VALIDATION_STRINGENCY=SILENT CREATE_INDEX=true
+
+java -jar ${fgbio} FilterConsensusReads --input=${outpath}/${sample}_consensus.mapped.bam --output=${outpath}/${sample}_consensus.mapped.filtered.bam --ref=${genome} --min-reads=2 1 1 --max-read-error-rate=0.05 --max-base-error-rate=0.1 --min-base-quality=50 --max-no-call-fraction=0.05 --require-single-strand-agreement=true
+
+
+#### 5. clip overlap between read pairs
+java -jar ${fgbio} ClipBam --input=${outpath}/${sample}_consensus.mapped.filtered.bam --output=${outpath}/${sample}_consensus.mapped.filtered.clipped.bam --ref=${genome} --clipping-mode=soft --clip-overlapping-reads=true
+
+
+#### 6.variant calling
+${Vardict_Dir}/VarDict -G ${genome} -N ${sample} -f ${min_af} -b ${outpath}/${sample}_consensus.mapped.filtered.clipped.bam -z -c 1 -S 2 -E 3 -g 4 -th 1 --nosv ${target}| ${Vardict_Dir}/teststrandbias.R|${Vardict_Dir}/var2vcf_valid.pl -N ${sample} -E -f ${min_af}|awk '{if ($q ~ /^#/) print; else if ($4 !=5) print}'  > ${outpath}/${sample}.vcf
+
+
+#### 7.annotation
+${anno} -vcfinput ${outpath}/${sample}.vcf -buildver hg19  /database/downdb/ -out ${outpath}/${sample} -remove -protocol refGene,clinvar_20210501,cosmic88,avsnp150 -operation g,f,f,f -nastring .
+#1000g2015aug,
+
+
+
+/GATK/4.1.2.0/gatk VariantsToTable -V ${outpath}/${sample}.hg19_multianno.vcf -O ${outpath}/${sample}.vd.norm.tab -F CHROM -F POS -F TYPE -F REF -F ALT -F avsnp150 -F cosmic88 -F AAChange.refGene -GF DP -GF VD -GF AD -GF AF --show-filtered
+# DP=Total Depth;  VD =Variant Depth; AF=Allele Frequency; 
+sed 's/\\x3b/;/g' ${outpath}/${sample}.vd.norm.tab | sed 's/\\x3d/=/g' > ${outpath}/${sample}.vd.norm.2.tab
+
+
+
+#### 8.QC
+# creat html:pdf
+${qualimap_dir}/qualimap bamqc -bam ${outpath}/${sample}_mapped.bam  -c --java-mem-size=4G -sd -gff ${target} 
+${qualimap_dir}/qualimap bamqc -bam ${outpath}/${sample}_consensus.mapped.filtered.clipped.bam  -c --java-mem-size=4G -sd -gff ${target}
+#-outdir ${outpath}/${sample}_qualimap_5 -outformat PDF:HTML
+
+
+# multiple-QC
+${qualimap_dir}/qualimap multi-bamqc -d /input_clipped_dir.txt  --java-mem-size=2G -outdir /results/multibamqc_clipped_demo -outformat PDF:HTML
+${qualimap_dir}/qualimap multi-bamqc -d /input_dir.txt  --java-mem-size=2G -outdir /results/multibamqc_demo -outformat PDF:HTML
+
+#summary all
+perl /qualimap_extract.pl -d ${outpath} /results/summary_bamqc_demo.txt
+
+
+
+
+
